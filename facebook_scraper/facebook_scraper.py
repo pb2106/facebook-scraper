@@ -14,7 +14,7 @@ import os
 from requests import RequestException
 from requests_html import HTMLSession
 
-from . import utils
+from . import utils, relay
 from .constants import (
     DEFAULT_PAGE_LIMIT,
     FB_BASE_URL,
@@ -47,12 +47,15 @@ logger = logging.getLogger(__name__)
 class FacebookScraper:
     """Class for creating FacebookScraper Iterators"""
 
-    base_url = FB_MOBILE_BASE_URL
+    base_url = FB_W3_BASE_URL
     default_headers = {
-        "Accept": "*/*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
         "Accept-Encoding": "gzip,deflate",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
     have_checked_locale = False
 
@@ -67,6 +70,7 @@ class FacebookScraper:
         self.session = session
         self.requests_kwargs = requests_kwargs
         self.request_count = 0
+        self._relay_doc_ids = {}
 
     def set_user_agent(self, user_agent):
         self.session.headers["User-Agent"] = user_agent
@@ -101,12 +105,13 @@ class FacebookScraper:
         return extractor.extract_reactors(response)
 
     def get_photos(self, account: str, **kwargs) -> Iterator[Post]:
+        kwargs["scraper"] = self
         iter_pages_fn = partial(iter_photos, account=account, request_fn=self.get, **kwargs)
         return self._generic_get_posts(extract_post, iter_pages_fn, **kwargs)
 
     def get_posts_by_hashtag(self, hashtag: str, **kwargs) -> Iterator[Post]:
         kwargs["scraper"] = self
-        kwargs["base_url"] = FB_MBASIC_BASE_URL
+        kwargs["base_url"] = FB_W3_BASE_URL
         iter_pages_fn = partial(
             iter_hashtag_pages, hashtag=hashtag, request_fn=self.get, **kwargs
         )
@@ -118,16 +123,37 @@ class FacebookScraper:
         for post_url in post_urls:
             url = str(post_url)
             if url.startswith(FB_BASE_URL):
-                url = url.replace(FB_BASE_URL, FB_MOBILE_BASE_URL)
-            if url.startswith(FB_W3_BASE_URL):
-                url = url.replace(FB_W3_BASE_URL, FB_MOBILE_BASE_URL)
-            if not url.startswith(FB_MOBILE_BASE_URL):
-                url = utils.urljoin(FB_MOBILE_BASE_URL, url)
+                url = url.replace(FB_BASE_URL, FB_W3_BASE_URL)
+            if url.startswith(FB_MOBILE_BASE_URL):
+                url = url.replace(FB_MOBILE_BASE_URL, FB_W3_BASE_URL)
+            if url.startswith(FB_MBASIC_BASE_URL):
+                url = url.replace(FB_MBASIC_BASE_URL, FB_W3_BASE_URL)
+            if not url.startswith("http"):
+                url = utils.urljoin(FB_W3_BASE_URL, url)
 
             post = {"original_request_url": post_url, "post_url": url}
             logger.debug(f"Requesting page from: {url}")
             response = self.get(url)
             options["response_url"] = response.url
+
+            if relay.is_comet_html(response.text):
+                stories, _, _ = relay.parse_relay_html(response.text)
+                if stories:
+                    post.update(
+                        relay.extract_relay_post(
+                            stories[0], options=options, request_fn=self.get
+                        )
+                    )
+                    if not post.get("post_url"):
+                        post["post_url"] = url
+                    if remove_source:
+                        post.pop('source', None)
+                    yield post
+                    continue
+                logger.warning("No posts found in Comet page.")
+                yield post
+                continue
+
             photo_post = False
             if "/stories/" in url or "/story/" in url:
                 elem = response.html.find("#story_viewer_content", first=True)
@@ -317,6 +343,9 @@ class FacebookScraper:
         if kwargs.get("allow_extra_requests", True):
             logger.debug(f"Requesting page from: {account}")
             response = self.get(account)
+            if relay.is_comet_html(response.text):
+                result.update(relay.extract_relay_profile(response.text))
+                return result
             try:
                 top_post = response.html.find(
                     '[data-ft*="top_level_post_id"]:not([data-sigil="m-see-translate-link"])',
@@ -620,6 +649,20 @@ class FacebookScraper:
         desc = None
 
         try:
+            url = f'/{page}/'
+            logger.debug(f"Requesting page from: {url}")
+            resp = self.get(url)
+            if relay.is_comet_html(resp.text):
+                result.update(relay.extract_relay_profile(resp.text))
+                if kwargs.get("reviews"):
+                    result["reviews"] = self.get_page_reviews(page, **kwargs)
+                    if kwargs.get("reviews") != "generator":
+                        result["reviews"] = utils.safe_consume(result["reviews"])
+                return result
+        except Exception as e:
+            logger.error(e)
+
+        try:
             about_url = f'/{page}/about/'
             logger.debug(f"Requesting page from: {about_url}")
             resp = self.get(about_url)
@@ -839,9 +882,7 @@ class FacebookScraper:
         return results
 
     def get_group_posts(self, group: Union[str, int], **kwargs) -> Iterator[Post]:
-        self.set_user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/603.3.8 (KHTML, like Gecko) Version/10.1.2 Safari/603.3.8"
-        )
+        kwargs["scraper"] = self
         iter_pages_fn = partial(iter_group_pages, group=group, request_fn=self.get, **kwargs)
         return self._generic_get_posts(extract_group_post, iter_pages_fn, **kwargs)
 
@@ -862,13 +903,36 @@ class FacebookScraper:
             self.request_count += 1
             url = str(url)
             if not url.startswith("http"):
-                url = utils.urljoin(FB_MOBILE_BASE_URL, url)
+                url = utils.urljoin(self.base_url, url)
 
             if kwargs.get("post"):
                 kwargs.pop("post")
-                response = self.session.post(url=url, **kwargs)
+                req_kwargs = {**self.requests_kwargs, **kwargs}
+                response = self.session.post(url=url, **req_kwargs)
             else:
                 response = self.session.get(url=url, **self.requests_kwargs, **kwargs)
+
+            # Follow JS/meta-refresh redirect stubs sometimes returned by Facebook
+            redirects = 0
+            while (
+                redirects < 3
+                and len(response.text) < 4096
+                and "<title>Redirecting...</title>" in response.text
+            ):
+                redir_match = re.search(
+                    r'window\.location\.replace\("([^"]+)"\)', response.text
+                ) or re.search(
+                    r'<meta[^>]+http-equiv="refresh"[^>]+url=([^"\s>]+)',
+                    response.text,
+                    re.IGNORECASE,
+                )
+                if not redir_match:
+                    break
+                next_url = redir_match.group(1).replace("\\/", "/")
+                logger.debug("Following JS/meta redirect to: %s", next_url)
+                response = self.session.get(url=next_url, **self.requests_kwargs)
+                redirects += 1
+
             DEBUG = False
             if DEBUG:
                 for filename in os.listdir("."):
@@ -876,26 +940,36 @@ class FacebookScraper:
                         logger.debug(f"Replacing {url} content with {filename}")
                         with open(filename) as f:
                             response.html.html = f.read()
-            response.html.html = response.html.html.replace('<!--', '').replace('-->', '')
+
             response.raise_for_status()
+
+            is_js = url.endswith(".js")
+            is_gql = relay.is_graphql_ndjson(response.text)
+            is_comet = relay.is_comet_html(response.text)
+            if is_js or is_gql:
+                return response
+
+            if not is_comet:
+                response.html.html = response.html.html.replace('<!--', '').replace('-->', '')
+
             self.check_locale(response)
 
             # Special handling for video posts that redirect to /watch/
             if response.url == "https://m.facebook.com/watch/?ref=watch_permalink":
-                post_url = re.search("\d+", url).group()
+                post_url = re.search(r"\d+", url).group()
                 if post_url:
                     url = utils.urljoin(
-                        FB_MOBILE_BASE_URL,
+                        FB_W3_BASE_URL,
                         f"story.php?story_fbid={post_url}&id=1&m_entstream_source=timeline",
                     )
-                    post = {"original_request_url": post_url, "post_url": url}
                     logger.debug(f"Requesting page from: {url}")
                     response = self.get(url)
-            if "/watch/" in response.url:
-                video_id = parse_qs(urlparse(response.url).query).get("v")[0]
-                url = f"story.php?story_fbid={video_id}&id={video_id}&m_entstream_source=video_home&player_suborigin=entry_point&player_format=permalink"
-                logger.debug(f"Fetching {url}")
-                response = self.get(url)
+            if "/watch/" in response.url and "v=" in response.url:
+                video_id = parse_qs(urlparse(response.url).query).get("v", [None])[0]
+                if video_id:
+                    url = f"story.php?story_fbid={video_id}&id={video_id}&m_entstream_source=video_home&player_suborigin=entry_point&player_format=permalink"
+                    logger.debug(f"Fetching {url}")
+                    response = self.get(url)
 
             if "cookie/consent-page" in response.url:
                 response = self.submit_form(response)
@@ -908,9 +982,14 @@ class FacebookScraper:
                 warnings.warn(
                     f"Facebook served mbasic/noscript content unexpectedly on {response.url}"
                 )
-            if response.html.find("h1,h2", containing="Unsupported Browser"):
+            if not is_comet and response.html.find("h1,h2", containing="Unsupported Browser"):
                 warnings.warn(f"Facebook says 'Unsupported Browser'")
-            title = response.html.find("title", first=True)
+            if is_comet:
+                title_match = re.search(r"<title[^>]*>(.*?)</title>", response.text, re.DOTALL)
+                title_text = title_match.group(1).strip() if title_match else ""
+            else:
+                title = response.html.find("title", first=True)
+                title_text = title.text if title else ""
             not_found_titles = ["page not found", "content not found"]
             temp_ban_titles = [
                 "you can't use this feature at the moment",
@@ -918,30 +997,30 @@ class FacebookScraper:
                 "you’re temporarily blocked",
             ]
             if "checkpoint" in response.url:
-                if response.html.find("h1", containing="We suspended your account"):
+                if "We suspended your account" in response.text:
                     raise exceptions.AccountDisabled("Your Account Has Been Disabled")
-            if title:
-                if title.text.lower() in not_found_titles:
-                    raise exceptions.NotFound(title.text)
-                elif title.text.lower() == "error":
+            if title_text:
+                title_lower = title_text.lower()
+                if title_lower in not_found_titles:
+                    raise exceptions.NotFound(title_text)
+                elif title_lower == "error":
                     raise exceptions.UnexpectedResponse("Your request couldn't be processed")
-                elif title.text.lower() in temp_ban_titles:
-                    raise exceptions.TemporarilyBanned(title.text)
-                elif ">your account has been disabled<" in response.html.html.lower():
+                elif title_lower in temp_ban_titles:
+                    raise exceptions.TemporarilyBanned(title_text)
+                elif ">your account has been disabled<" in response.text.lower():
                     raise exceptions.AccountDisabled("Your Account Has Been Disabled")
                 elif (
                     ">We saw unusual activity on your account. This may mean that someone has used your account without your knowledge.<"
-                    in response.html.html
+                    in response.text
                 ):
                     raise exceptions.AccountDisabled("Your Account Has Been Locked")
-                elif (
-                    title.text == "Log in to Facebook | Facebook"
-                    or response.url.startswith(utils.urljoin(FB_MOBILE_BASE_URL, "login"))
-                    or response.url.startswith(utils.urljoin(FB_W3_BASE_URL, "login"))
-                ):
-                    raise exceptions.LoginRequired(
-                        "A login (cookies) is required to see this page"
-                    )
+            if (
+                title_text in ("Log in to Facebook | Facebook", "Log into Facebook")
+                or urlparse(response.url).path.startswith("/login")
+            ):
+                raise exceptions.LoginRequired(
+                    "A login (cookies) is required to see this page"
+                )
             return response
         except RequestException as ex:
             logger.exception("Exception while requesting URL: %s\nException: %r", url, ex)
@@ -1006,6 +1085,15 @@ class FacebookScraper:
         except exceptions.LoginRequired:
             return False
 
+    def _extract_post_item(self, post_element, extract_post_fn, options, remove_source):
+        if isinstance(post_element, dict):
+            post = relay.extract_relay_post(post_element, options=options, request_fn=self.get)
+        else:
+            post = extract_post_fn(post_element, options=options, request_fn=self.get)
+        if remove_source:
+            post.pop("source", None)
+        return post
+
     def _generic_get_posts(
         self,
         extract_post_fn,
@@ -1051,10 +1139,9 @@ class FacebookScraper:
 
                 for post_element in page:
                     try:
-                        post = extract_post_fn(post_element, options=options, request_fn=self.get)
-
-                        if remove_source:
-                            post.pop("source", None)
+                        post = self._extract_post_item(
+                            post_element, extract_post_fn, options, remove_source
+                        )
 
                         # date is None, no way to check latest_date, yield it
                         if post["time"] is None:
@@ -1115,10 +1202,9 @@ class FacebookScraper:
             for i, page in zip(counter, iter_pages_fn()):
                 logger.debug("Extracting posts from page %s", i)
                 for post_element in page:
-                    post = extract_post_fn(post_element, options=options, request_fn=self.get)
-                    if remove_source:
-                        post.pop('source', None)
-                    yield post
+                    yield self._extract_post_item(
+                        post_element, extract_post_fn, options, remove_source
+                    )
 
     def get_groups_by_search(self, word: str, **kwargs):
         group_search_url = utils.urljoin(FB_MOBILE_BASE_URL, f"search/groups/?q={word}")

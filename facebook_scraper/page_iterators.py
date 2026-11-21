@@ -8,8 +8,14 @@ import time
 from requests.exceptions import HTTPError
 import warnings
 
-from . import utils
-from .constants import FB_MOBILE_BASE_URL, FB_MBASIC_BASE_URL
+from . import utils, relay
+from .constants import (
+    DEFAULT_PROFILE_TIMELINE_REFETCH_DOC_ID,
+    FB_GRAPHQL_URL,
+    FB_MOBILE_BASE_URL,
+    FB_MBASIC_BASE_URL,
+    FB_W3_BASE_URL,
+)
 
 from .fb_types import URL, Page, RawPage, RequestFunction, Response
 from . import exceptions
@@ -21,18 +27,14 @@ logger = logging.getLogger(__name__)
 def iter_hashtag_pages(hashtag: str, request_fn: RequestFunction, **kwargs) -> Iterator[Page]:
     start_url = kwargs.pop("start_url", None)
     if not start_url:
-        start_url = utils.urljoin(FB_MBASIC_BASE_URL, f'/hashtag/{hashtag}/')
-        try:
-            request_fn(start_url)
-        except Exception as ex:
-            logger.error(ex)
+        start_url = utils.urljoin(FB_W3_BASE_URL, f'/hashtag/{hashtag}/')
     return generic_iter_pages(start_url, HashtagPageParser, request_fn, **kwargs)
 
 
 def iter_pages(account: str, request_fn: RequestFunction, **kwargs) -> Iterator[Page]:
     start_url = kwargs.pop("start_url", None)
     if not start_url:
-        start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/{account}/')
+        start_url = utils.urljoin(FB_W3_BASE_URL, f'/{account}/')
     return generic_iter_pages(start_url, PageParser, request_fn, **kwargs)
 
 
@@ -42,7 +44,7 @@ def iter_group_pages(
     start_url = kwargs.pop("start_url", None)
 
     if not start_url:
-        start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'groups/{group}/')
+        start_url = utils.urljoin(FB_W3_BASE_URL, f'groups/{group}/')
 
     return generic_iter_pages(start_url, GroupPageParser, request_fn, **kwargs)
 
@@ -51,7 +53,7 @@ def iter_search_pages(word: str, request_fn: RequestFunction, **kwargs) -> Itera
     start_url = kwargs.pop("start_url", None)
     if not start_url:
         start_url = utils.urljoin(
-            FB_MOBILE_BASE_URL,
+            FB_W3_BASE_URL,
             f'/search/posts?q={word}'
             f'&filters=eyJyZWNlbnRfcG9zdHM6MCI6IntcIm5hbWVcIjpcInJlY2VudF9wb3N0c1wiLFwiYXJnc1wiOlwiXCJ9In0%3D',
         )
@@ -59,13 +61,95 @@ def iter_search_pages(word: str, request_fn: RequestFunction, **kwargs) -> Itera
             request_fn(start_url)
         except Exception as ex:
             logger.error(ex)
-            start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/search/posts?q={word}')
+            start_url = utils.urljoin(FB_W3_BASE_URL, f'/search/posts?q={word}')
     return generic_iter_pages(start_url, SearchPageParser, request_fn, **kwargs)
 
 
 def iter_photos(account: str, request_fn: RequestFunction, **kwargs) -> Iterator[Page]:
-    start_url = utils.urljoin(FB_MOBILE_BASE_URL, f'/{account}/photos/')
+    start_url = utils.urljoin(FB_W3_BASE_URL, f'/{account}/photos/')
     return generic_iter_pages(start_url, PhotosPageParser, request_fn, **kwargs)
+
+
+def _request_with_retries(request_fn: RequestFunction, url: str, scraper=None, **req_kwargs):
+    RETRY_LIMIT = 6
+    for retry in range(1, RETRY_LIMIT + 1):
+        try:
+            logger.debug("Requesting page from: %s", url)
+            return request_fn(url, **req_kwargs)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 500 and retry < RETRY_LIMIT:
+                sleep_duration = retry * 2
+                logger.debug(
+                    f"Caught exception, retry number {retry}. Sleeping for {sleep_duration}s"
+                )
+                if retry == (RETRY_LIMIT / 2) and scraper is not None:
+                    logger.debug("Requesting noscript")
+                    scraper.set_noscript(True)
+                time.sleep(sleep_duration)
+            else:
+                raise
+
+
+def _iter_comet_pages(response, request_fn: RequestFunction, **kwargs) -> Iterator[Page]:
+    """Iterate pages from an initial Comet SSR HTML response via GraphQL pagination."""
+    scraper = kwargs.get("scraper")
+    cookies = getattr(getattr(scraper, "session", None), "cookies", None)
+    doc_id_cache = getattr(scraper, "_relay_doc_ids", None)
+    if doc_id_cache is None:
+        doc_id_cache = {}
+        if scraper is not None:
+            scraper._relay_doc_ids = doc_id_cache
+
+    relay_ctx = relay.extract_relay_context(response.text, url=response.url, cookies=cookies)
+    stories, cursor, has_next_page = relay.parse_relay_html(response.text)
+    logger.debug("Got %s raw posts from Comet SSR page", len(stories))
+    yield stories
+
+    # Currently timeline feed refetch is supported via ProfileCometTimelineFeedRefetchQuery
+    can_paginate_timeline = (
+        relay_ctx.get("query_name") == "ProfileCometTimelineFeedQuery"
+        or "userID" in (relay_ctx.get("query_vars") or {})
+    )
+    if not can_paginate_timeline:
+        return
+
+    posts_per_page = kwargs.get("options", {}).get("posts_per_page")
+    request_url_callback = kwargs.get("request_url_callback")
+    operation_name = "ProfileCometTimelineFeedRefetchQuery"
+    doc_id = None
+
+    while has_next_page and cursor:
+        if doc_id is None:
+            doc_id = relay.resolve_doc_id(
+                relay_ctx.get("js_urls") or [],
+                operation_name,
+                request_fn,
+                doc_id_cache,
+                fallback=DEFAULT_PROFILE_TIMELINE_REFETCH_DOC_ID,
+            )
+        if request_url_callback:
+            request_url_callback(f"{FB_GRAPHQL_URL}?cursor={cursor}")
+
+        form_data, extra_headers = relay.build_graphql_pagination_request(
+            relay_ctx,
+            cursor,
+            doc_id=doc_id,
+            posts_per_page=posts_per_page,
+            operation_name=operation_name,
+        )
+        gql_resp = _request_with_retries(
+            request_fn,
+            FB_GRAPHQL_URL,
+            scraper=scraper,
+            post=True,
+            data=form_data,
+            headers=extra_headers,
+        )
+        stories, cursor, has_next_page = relay.parse_graphql_ndjson(gql_resp.text)
+        logger.debug("Got %s raw posts from GraphQL page", len(stories))
+        if not stories:
+            break
+        yield stories
 
 
 def generic_iter_pages(
@@ -73,31 +157,19 @@ def generic_iter_pages(
 ) -> Iterator[Page]:
     next_url = start_url
 
-    base_url = kwargs.get('base_url', FB_MOBILE_BASE_URL)
+    base_url = kwargs.get('base_url', FB_W3_BASE_URL)
     request_url_callback = kwargs.get('request_url_callback')
+    scraper = kwargs.get("scraper")
     while next_url:
         # Execute callback of starting a new URL request
         if request_url_callback:
             request_url_callback(next_url)
 
-        RETRY_LIMIT = 6
-        for retry in range(1, RETRY_LIMIT + 1):
-            try:
-                logger.debug("Requesting page from: %s", next_url)
-                response = request_fn(next_url)
-                break
-            except HTTPError as e:
-                if e.response.status_code == 500 and retry < RETRY_LIMIT:
-                    sleep_duration = retry * 2
-                    logger.debug(
-                        f"Caught exception, retry number {retry}. Sleeping for {sleep_duration}s"
-                    )
-                    if retry == (RETRY_LIMIT / 2):
-                        logger.debug("Requesting noscript")
-                        kwargs["scraper"].set_noscript(True)
-                    time.sleep(sleep_duration)
-                else:
-                    raise
+        response = _request_with_retries(request_fn, next_url, scraper=scraper)
+
+        if relay.is_comet_html(response.text):
+            yield from _iter_comet_pages(response, request_fn, **kwargs)
+            return
 
         logger.debug("Parsing page response")
         parser = page_parser_cls(response)
