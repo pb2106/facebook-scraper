@@ -643,9 +643,11 @@ class PostExtractor:
             if response.html.find("a", containing="Photos from", first=True):
                 # Right arrow link
                 direction = '{"tn":"+="}'
-            url = response.html.find(f"a.touchable[data-gt='{direction}']", first=True).attrs[
-                "href"
-            ]
+            next_link = response.html.find(f"a.touchable[data-gt='{direction}']", first=True)
+            if not next_link or "href" not in next_link.attrs:
+                logger.warning("No next photo link found in gallery")
+                break
+            url = next_link.attrs["href"]
             if not url.startswith("http"):
                 url = utils.urljoin(FB_MOBILE_BASE_URL, url)
             logger.debug(f"Fetching {url}")

@@ -748,7 +748,9 @@ class FacebookScraper:
             logger.error(e)
         if desc:
             logger.debug(desc.attrs["content"])
-            match = re.search(r'\..+?(\d[\d,.]+).+·', desc.attrs["content"])
+            match = re.search(r'(\d[\d,.]+)\s+likes?\b', desc.attrs["content"], re.IGNORECASE)
+            if not match:
+                match = re.search(r'\.\s*([\d,.]+)\s+[^·]*·', desc.attrs["content"])
             if match:
                 result["likes"] = utils.parse_int(match.groups()[0])
             bits = desc.attrs["content"].split("·")

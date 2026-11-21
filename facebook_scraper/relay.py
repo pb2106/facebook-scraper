@@ -256,7 +256,113 @@ def _collect_stories_and_page_info(
     for payload in payloads:
         walk(payload)
 
+    if not stories:
+        video_story = _extract_video_permalink_story(payloads)
+        if video_story:
+            stories.append(video_story)
+
     return stories, next_cursor, has_next_page
+
+
+def _extract_video_permalink_story(payloads: List[Any]) -> Optional[Dict[str, Any]]:
+    """Synthesize a Story dict from video/Watch permalink SSR payloads (/videos/<id>/)."""
+    video_media: Optional[Dict[str, Any]] = None
+    feedback_data: Optional[Dict[str, Any]] = None
+    creation_story_meta: Optional[Dict[str, Any]] = None
+    video_id: Optional[str] = None
+    message_obj: Optional[Dict[str, Any]] = None
+    owner_id: Optional[str] = None
+    owner_name: Optional[str] = None
+    owner_url: Optional[str] = None
+
+    def collect_owner(own: Any):
+        nonlocal owner_id, owner_name, owner_url
+        if not isinstance(own, dict):
+            return
+        as_page = own.get("owner_as_page") or {}
+        owner_id = owner_id or as_page.get("id") or (str(own["id"]) if own.get("id") else None)
+        owner_name = owner_name or as_page.get("name") or own.get("name")
+        owner_url = owner_url or own.get("url") or own.get("profile_url")
+
+    def walk(obj: Any):
+        nonlocal video_media, feedback_data, creation_story_meta, video_id, message_obj
+        if isinstance(obj, dict):
+            if "videoDeliveryLegacyFields" in obj and obj.get("__typename") == "Video":
+                video_media = obj
+                video_id = video_id or (str(obj["id"]) if obj.get("id") else None)
+                collect_owner(obj.get("owner"))
+            if (
+                isinstance(obj.get("feedback"), dict)
+                and "video_view_count_renderer" in obj["feedback"]
+            ):
+                feedback_data = obj["feedback"]
+                video_id = video_id or (str(obj["id"]) if obj.get("id") else None)
+                collect_owner(obj.get("owner"))
+                cs_inner = obj.get("creation_story") or {}
+                if isinstance(cs_inner.get("message"), dict):
+                    message_obj = cs_inner["message"]
+            if (
+                obj.get("__typename") == "Video"
+                and isinstance(obj.get("creation_story"), dict)
+                and "comet_sections" in obj["creation_story"]
+            ):
+                creation_story_meta = obj["creation_story"]
+                video_id = video_id or (str(obj["id"]) if obj.get("id") else None)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    for payload in payloads:
+        walk(payload)
+
+    if not video_media and not feedback_data:
+        return None
+
+    cs_sections = (creation_story_meta or {}).get("comet_sections") or {}
+    if not message_obj:
+        message_obj = ((cs_sections.get("message") or {}).get("story") or {}).get("message")
+
+    creation_time = (video_media or {}).get("publish_time")
+    permalink_url = (video_media or {}).get("permalink_url") or (video_media or {}).get("url")
+    actors = []
+    for meta in cs_sections.get("metadata") or []:
+        st = (meta or {}).get("story") or {}
+        creation_time = creation_time or st.get("creation_time")
+        permalink_url = permalink_url or st.get("url")
+        for act in st.get("actors") or []:
+            collect_owner(act)
+
+    if owner_id or owner_name or owner_url:
+        actors = [{"id": owner_id, "name": owner_name, "url": owner_url}]
+
+    story: Dict[str, Any] = {
+        "__typename": "Story",
+        "post_id": video_id,
+        "creation_time": creation_time,
+        "permalink_url": permalink_url,
+        "actors": actors,
+        "message": message_obj,
+        "attachments": (
+            [
+                {
+                    "media": {"__typename": "Video", "id": video_id},
+                    "styles": {
+                        "__typename": "StoryAttachmentVideoStyleRenderer",
+                        "attachment": {"media": video_media},
+                    },
+                }
+            ]
+            if video_media
+            else []
+        ),
+        "comet_sections": {
+            "feedback": feedback_data or {},
+        },
+    }
+    return story
+
 
 
 def parse_relay_html(html_text: str) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
@@ -694,7 +800,9 @@ def _extract_attachments(story: Dict[str, Any]) -> Dict[str, Any]:
                 video_info["video"] = video_url
             if media.get("id"):
                 video_info["video_id"] = str(media["id"])
-            thumb = (media.get("thumbnailImage") or {}).get("uri")
+            thumb = (media.get("thumbnailImage") or {}).get("uri") or (
+                (media.get("preferred_thumbnail") or {}).get("image") or {}
+            ).get("uri")
             if thumb:
                 video_info["video_thumbnail"] = thumb
             dur_ms = media.get("playable_duration_in_ms")
@@ -790,12 +898,32 @@ def _extract_feedback(story: Dict[str, Any]) -> Dict[str, Any]:
                 (cri["comment_rendering_instance"].get("comments") or {}).get("total_count")
             )
 
+    video_watches = None
+    vvc_holder = _find_first(
+        fb_section,
+        lambda x: isinstance(x, dict)
+        and (
+            "video_view_count_renderer" in x
+            or x.get("video_view_count") is not None
+            or x.get("video_post_view_count") is not None
+        ),
+    )
+    if vvc_holder:
+        vvc_fb = (
+            (vvc_holder.get("video_view_count_renderer") or {}).get("feedback") or vvc_holder
+        )
+        for key in ("video_view_count", "video_post_view_count", "play_count"):
+            if vvc_fb.get(key) is not None:
+                video_watches = int(vvc_fb[key])
+                break
+
     return {
         "likes": likes,
         "reactions": reactions or None,
         "reaction_count": reaction_count,
         "shares": share_count,
         "comments": comment_count,
+        "video_watches": video_watches,
         "feedback_section": fb_section,
     }
 
@@ -939,6 +1067,8 @@ def extract_relay_post(
     post["shares"] = fb_info["shares"]
     post["reactions"] = fb_info["reactions"]
     post["reaction_count"] = fb_info["reaction_count"]
+    if fb_info.get("video_watches") is not None:
+        post["video_watches"] = fb_info["video_watches"]
     post["fetched_time"] = datetime.now()
 
     if options.get("comments"):
