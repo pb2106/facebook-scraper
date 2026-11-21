@@ -157,12 +157,14 @@ for comment in comments:
 
 ### Notes
 
+- Requests now use `https://www.facebook.com/` (Comet SSR HTML and `/api/graphql/` pagination), as `mbasic.facebook.com` and legacy `m.facebook.com` HTML have been deprecated by Facebook.
+- Reactions, `video_watches`, and inline comments (when `options={"comments": True}`) are extracted directly from the Relay payload when available.
 - There is no guarantee that every field will be extracted (they might be `None`).
 - Group posts may be missing some fields like `time` and `post_url`.
 - Group scraping may return only one page and not work on private groups.
 - If you scrape too much, Facebook might temporarily ban your IP.
 - The vast majority of unique IDs on facebook (post IDs, video IDs, photo IDs, comment IDs, profile IDs, etc) can be appended to "https://www.facebook.com/" to result in a redirect to the corresponding object.
-- Some functions (such as extracting reactions) require you to be logged into Facebook (pass cookies). If something isn't working as expected, try pass cookies and see if that fixes it.
+- Some functions (such as private/login-gated groups or full account profiles) require you to be logged into Facebook (pass cookies). If something isn't working as expected, try passing cookies and see if that fixes it.
 - Reaction Categories (EN): [`like`, `love`, `haha`, `sorry`, `wow`, `angry`, `care`]
 
 ## Comment & Reply example
