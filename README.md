@@ -6,7 +6,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/facebook-scraper?color=blue)](https://pypi.python.org/pypi/facebook-scraper/)
 [![PyPI pyversions](https://img.shields.io/pypi/pyversions/facebook-scraper.svg)](https://pypi.python.org/pypi/facebook-scraper/)
-[![GitHub commits since tagged version](https://img.shields.io/github/commits-since/kevinzg/facebook-scraper/v0.2.59)](https://github.com/kevinzg/facebook-scraper/commits/)
+[![GitHub commits since tagged version](https://img.shields.io/github/commits-since/pb2106/facebook-scraper/v0.2.59)](https://github.com/pb2106/facebook-scraper/commits/)
 
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
@@ -14,17 +14,26 @@ Scrape Facebook public pages without an API key. Inspired by [twitter-scraper](h
 
 ## Install
 
-To install the latest release from PyPI:
+To install from this repository (recommended, includes the `www.facebook.com` Comet SSR & GraphQL fixes):
 
 ```sh
-pip install facebook-scraper
+pip install git+https://github.com/pb2106/facebook-scraper.git
 ```
 
-Or, to install the latest master branch:
+Or to install from a local clone:
 
 ```sh
-pip install git+https://github.com/kevinzg/facebook-scraper.git
+git clone https://github.com/pb2106/facebook-scraper.git
+cd facebook-scraper
+pip install -e .
 ```
+
+### What's Fixed
+
+- **Modern `www.facebook.com` Comet SSR & GraphQL pagination**: Switched away from deprecated `mbasic.facebook.com` and legacy `m.facebook.com` HTML to parse Comet `<script type="application/json">` Relay payloads and paginate timelines via `POST https://www.facebook.com/api/graphql/` (`@defer` / `@stream` NDJSON + dynamic `doc_id` resolution).
+- **Video permalinks & `video_watches`**: Added support for `/videos/<id>/` permalink pages (`post_id`, `time`, `username`, `user_id`, `video`, `video_thumbnail`, `video_duration_seconds`) and extracted `video_watches` from `video_view_count_renderer`.
+- **Profiles & page info**: Added Comet SSR extraction in `get_profile()` and `get_page_info()` (`id`, `Name`, `about`, `Follower_count`, `cover_photo`, `profile_picture`, `top_post`), and tightened the legacy `likes` regex so numbers in page titles aren't misparsed as likes.
+- **Reactions, comments, images, & encoding**: Extracts reactions, inline comments, multi-image albums, shared posts (`attached_story`), and UTF-8 text directly from Relay JSON, plus guards missing next-photo links in legacy `extract_photo_link`.
 
 ## Usage
 
